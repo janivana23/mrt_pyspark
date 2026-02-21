@@ -1,110 +1,181 @@
-# mrtspark_full.py
-from pyspark.sql import SparkSession
-from pyspark.sql.functions import col, to_date
-from pyspark.ml.feature import StringIndexer, VectorAssembler
-from pyspark.ml.regression import LinearRegression
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+import os
+import pandas as pd
 import matplotlib.pyplot as plt
+from pyspark.sql import SparkSession
+from pyspark.sql.functions import col, avg, sum as spark_sum, to_date
+from sklearn.cluster import KMeans
+from prophet import Prophet
 
-# -------------------------
-# 1. Initialize Spark
-# -------------------------
-spark = SparkSession.builder.appName("MRT_DataScience").getOrCreate()
+# ---------------------------
+# SETTINGS
+# ---------------------------
+INPUT_FILE = "trainvolume.csv"
+OUTPUT_DIR = "output"
+RANDOM_SEED = 42
 
-# -------------------------
-# 2. Load CSV data
-# -------------------------
-df = spark.read.csv("trainvolume.csv", header=True, inferSchema=True)
+os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-# Convert date column
-df = df.withColumn("train_volume_date", to_date(col("train_volume_year_month"), "yyyy-MM-dd"))
+# ---------------------------
+# INITIALIZE SPARK
+# ---------------------------
+spark = SparkSession.builder.appName("Singapore MRT Analysis").getOrCreate()
 
-print("Columns in DF:", df.columns)
+# ---------------------------
+# LOAD DATA
+# ---------------------------
+df = spark.read.csv(INPUT_FILE, header=True, inferSchema=True)
+print("Data loaded:")
 df.show(5)
 
-# -------------------------
-# 3. Exploratory Data Analysis
-# -------------------------
+# ---------------------------
+# PREPROCESS
+# ---------------------------
+# Convert train_volume_year_month to date
+df = df.withColumn("date", to_date("train_volume_year_month", "yyyy-MM-dd"))
+# Total volume per row
+df = df.withColumn("total_volume", col("train_volume_tap_in") + col("train_volume_tap_out"))
 
-# a) Check for missing values
-from pyspark.sql.functions import isnan, when, count
-df.select([count(when(isnan(c) | col(c).isNull(), c)).alias(c) for c in df.columns]).show()
+# ---------------------------
+# EDA: Hourly Stats
+# ---------------------------
+hourly_stats = df.groupBy("train_volume_hour") \
+    .agg(avg("total_volume").alias("avg_volume")) \
+    .orderBy("train_volume_hour")
+hourly_stats_pd = hourly_stats.toPandas()
+hourly_stats_pd.to_csv(f"{OUTPUT_DIR}/hourly_stats.csv", index=False)
 
-# b) Basic statistics
-df.describe(["train_volume_tap_in", "train_volume_tap_out"]).show()
-
-# c) Passenger counts by train line
-df.groupBy("train_code").sum("train_volume_tap_in", "train_volume_tap_out").show()
-
-# d) Passenger distribution by day type
-df.groupBy("train_volume_day").avg("train_volume_tap_in", "train_volume_tap_out").show()
-
-# e) Hourly passenger patterns
-df.groupBy("train_volume_hour").avg("train_volume_tap_in", "train_volume_tap_out").orderBy("train_volume_hour").show()
-
-# -------------------------
-# 4. Feature Engineering
-# -------------------------
-
-# Total passengers
-df = df.withColumn("total_passengers", col("train_volume_tap_in") + col("train_volume_tap_out"))
-
-# Encode day type
-indexer = StringIndexer(inputCol="train_volume_day", outputCol="day_type_index")
-df = indexer.fit(df).transform(df)
-
-# Use hour from train_volume_hour
-df = df.withColumn("hour_extracted", col("train_volume_hour"))
-
-df.show(5)
-
-# -------------------------
-# 5. Aggregations
-# -------------------------
-
-# a) Daily passenger volumes per train line
-daily_df = df.groupBy("train_volume_date", "train_code") \
-             .sum("total_passengers") \
-             .withColumnRenamed("sum(total_passengers)", "daily_total_passengers")
-daily_df.show(5)
-
-# b) Average passengers per hour
-hourly_df = df.groupBy("train_volume_hour") \
-              .avg("total_passengers") \
-              .orderBy("train_volume_hour")
-hourly_df.show()
-
-# -------------------------
-# 6. Visualization
-# -------------------------
-
-# Convert to Pandas for plotting
-hourly_pd = hourly_df.toPandas()
-
-plt.figure(figsize=(10,5))
-plt.plot(hourly_pd['train_volume_hour'], hourly_pd['avg(total_passengers)'], marker='o')
+plt.figure()
+plt.bar(hourly_stats_pd["train_volume_hour"], hourly_stats_pd["avg_volume"], color="skyblue")
 plt.xlabel("Hour of Day")
-plt.ylabel("Average Passengers")
-plt.title("Average Passengers by Hour")
-plt.grid(True)
-plt.show()
+plt.ylabel("Average Passenger Volume")
+plt.title("Hourly Passenger Volume")
+plt.tight_layout()
+plt.savefig(f"{OUTPUT_DIR}/hourly_stats.png")
+plt.close()
 
-# -------------------------
-# 7. Predictive Modeling
-# -------------------------
+# ---------------------------
+# Peak Hour Detection
+# ---------------------------
+peak_hour_pd = hourly_stats.orderBy(col("avg_volume").desc()).limit(1).toPandas()
+peak_hour_pd.to_csv(f"{OUTPUT_DIR}/peak_hour.csv", index=False)
 
-# Features: hour and day type index
-assembler = VectorAssembler(inputCols=["hour_extracted", "day_type_index"], outputCol="features")
-train_data = assembler.transform(df).select("features", "total_passengers")
+plt.figure()
+plt.bar(hourly_stats_pd["train_volume_hour"], hourly_stats_pd["avg_volume"], color='orange')
+plt.axvline(peak_hour_pd['train_volume_hour'][0], color='red', linestyle='--', label='Peak Hour')
+plt.xlabel("Hour of Day")
+plt.ylabel("Average Passenger Volume")
+plt.title("Peak Hour Detection")
+plt.legend()
+plt.tight_layout()
+plt.savefig(f"{OUTPUT_DIR}/peak_hour.png")
+plt.close()
 
-# Linear regression
-lr = LinearRegression(featuresCol="features", labelCol="total_passengers")
-model = lr.fit(train_data)
+# ---------------------------
+# Daily Time-Series Forecasting
+# ---------------------------
+daily_volume = df.groupBy("date") \
+    .agg(spark_sum("total_volume").alias("total_volume")) \
+    .orderBy("date") \
+    .toPandas()
+daily_volume.rename(columns={"date": "ds", "total_volume": "y"}, inplace=True)
 
-# Predictions
-predictions = model.transform(train_data)
-predictions.select("features", "total_passengers", "prediction").show(5)
+m = Prophet(daily_seasonality=True)
+m.fit(daily_volume)
+future = m.make_future_dataframe(periods=30)
+forecast = m.predict(future)
+forecast[['ds', 'yhat', 'yhat_lower', 'yhat_upper']].to_csv(f"{OUTPUT_DIR}/forecast.csv", index=False)
 
-# -------------------------
-# 8. Stop Spark
-# -------------------------
+fig = m.plot(forecast)
+fig.savefig(f"{OUTPUT_DIR}/forecast_plot.png")
+plt.close()
+
+# ---------------------------
+# Station Clustering
+# ---------------------------
+station_df = df.groupBy("train_code") \
+    .agg(avg("total_volume").alias("avg_volume")) \
+    .toPandas()
+kmeans_station = KMeans(n_clusters=3, random_state=RANDOM_SEED)
+station_df['cluster'] = kmeans_station.fit_predict(station_df[['avg_volume']])
+station_df.to_csv(f"{OUTPUT_DIR}/station_clusters.csv", index=False)
+
+# ---------------------------
+# Improved Station Clustering Plot
+# ---------------------------
+plt.figure(figsize=(20,6))  # wider figure for many stations
+for c in station_df['cluster'].unique():
+    subset = station_df[station_df['cluster'] == c]
+    plt.scatter(subset['train_code'], subset['avg_volume'], label=f'Cluster {c}', s=50)
+
+plt.xticks(rotation=90)  # rotate x labels
+plt.xlabel("Train Code")
+plt.ylabel("Average Volume")
+plt.title("Station Clusters")
+plt.legend()
+
+# Optional: reduce label density if too crowded
+# plt.xticks(ticks=range(0, len(station_df['train_code']), 2),
+#            labels=station_df['train_code'][::2], rotation=90)
+
+plt.tight_layout()
+plt.savefig(f"{OUTPUT_DIR}/station_clusters.png", dpi=300)
+plt.close()
+
+# ---------------------------
+# Spark SQL Dashboard
+# ---------------------------
+df.createOrReplaceTempView("mrt_volume")
+
+busiest_station = spark.sql("""
+SELECT train_code, AVG(total_volume) AS avg_volume
+FROM mrt_volume
+GROUP BY train_code
+ORDER BY avg_volume DESC
+LIMIT 5
+""")
+busiest_station.toPandas().to_csv(f"{OUTPUT_DIR}/busiest_stations.csv", index=False)
+
+top_hours = spark.sql("""
+SELECT train_code, train_volume_hour AS hour, AVG(total_volume) AS avg_volume
+FROM mrt_volume
+GROUP BY train_code, train_volume_hour
+ORDER BY avg_volume DESC
+""")
+top_hours.toPandas().to_csv(f"{OUTPUT_DIR}/top_hours_per_station.csv", index=False)
+
+# ---------------------------
+# Markdown Report
+# ---------------------------
+report_md = f"""
+# Singapore MRT Analysis Report
+
+## 1. Overview
+- Total rows: {df.count()}
+- Columns: {df.columns}
+
+## 2. EDA
+- Hourly passenger volume saved as `hourly_stats.csv` and `hourly_stats.png`
+
+## 3. Peak Hour Detection
+- Peak hour: {peak_hour_pd['train_volume_hour'][0]}
+- CSV: `peak_hour.csv`, Plot: `peak_hour.png`
+
+## 4. Forecasting
+- Forecast for next 30 days saved as `forecast.csv` and `forecast_plot.png`
+
+## 5. Station/Line Segmentation
+- Station clusters saved in `station_clusters.csv` and `station_clusters.png`
+
+## 6. Spark SQL Dashboard
+- Top stations: `busiest_stations.csv`
+- Top hours per station: `top_hours_per_station.csv`
+"""
+
+with open(f"{OUTPUT_DIR}/report.md", "w") as f:
+    f.write(report_md)
+
+print("✅ All outputs saved in folder:", OUTPUT_DIR)
 spark.stop()
